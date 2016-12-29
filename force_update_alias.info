@@ -1,0 +1,7 @@
+name = Force Update URL Alias
+description = Allows bulk updates to URL aliases that override the "generate automatic URL alias" setting.
+core = 7.x
+version = "7.x-1.0"
+project = "force_update_alias"
+
+dependencies[] = pathauto
