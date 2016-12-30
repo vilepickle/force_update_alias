@@ -49,7 +49,7 @@ function force_update_alias_node_update_alias(stdClass $node, $op, array $option
 
   module_load_include('inc', 'pathauto');
   $uri = entity_uri('node', $node);
-  return pathauto_create_alias('node', $op, $uri['path'], array('node' => $node), $node->type, $options['language']);
+  return force_update_alias_create_alias('node', $op, $uri['path'], array('node' => $node), $node->type, $options['language']);
 }
 
 /**
@@ -73,5 +73,164 @@ function force_update_alias_node_update_alias_multiple(array $nids, $op, array $
 
   if (!empty($options['message'])) {
     drupal_set_message(format_plural(count($nids), 'Updated URL alias for 1 node.', 'Updated URL aliases for @count nodes.'));
+  }
+}
+
+/**
+ * Apply patterns to create an alias.
+ *
+ * @param $module
+ *   The name of your module (e.g., 'node').
+ * @param $op
+ *   Operation being performed on the content being aliased
+ *   ('insert', 'update', 'return', or 'bulkupdate').
+ * @param $source
+ *   An internal Drupal path to be aliased.
+ * @param $data
+ *   An array of keyed objects to pass to token_replace(). For simple
+ *   replacement scenarios 'node', 'user', and others are common keys, with an
+ *   accompanying node or user object being the value. Some token types, like
+ *   'site', do not require any explicit information from $data and can be
+ *   replaced even if it is empty.
+ * @param $type
+ *   For modules which provided pattern items in hook_pathauto(),
+ *   the relevant identifier for the specific item to be aliased
+ *   (e.g., $node->type).
+ * @param $language
+ *   A string specify the path's language.
+ *
+ * @return array|null|false
+ *   The alias array that was created, NULL if an empty alias was generated, or
+ *   FALSE if the alias generation was not possible.
+ *
+ * @see _pathauto_set_alias()
+ * @see token_replace()
+ */
+function force_update_alias_create_alias($module, $op, $source, $data, $type = NULL, $language = LANGUAGE_NONE) {
+  // Retrieve and apply the pattern for this content type.
+  $pattern = pathauto_pattern_load_by_entity($module, $type, $language);
+
+  // Allow other modules to alter the pattern.
+  $context = array(
+    'module' => $module,
+    'op' => $op,
+    'source' => $source,
+    'data' => $data,
+    'type' => $type,
+    'language' => &$language,
+  );
+
+  // Replace any tokens in the pattern. Uses callback option to clean replacements. No sanitization.
+  $alias = token_replace($pattern, $data, array(
+    'sanitize' => FALSE,
+    'clear' => TRUE,
+    'callback' => 'pathauto_clean_token_values',
+    'language' => (object) array('language' => $language),
+    'pathauto' => TRUE,
+  ));
+
+  // Check if the token replacement has not actually replaced any values. If
+  // that is the case, then stop because we should not generate an alias.
+  // @see token_scan()
+  $pattern_tokens_removed = preg_replace('/\[[^\s\]:]*:[^\s\]]*\]/', '', $pattern);
+  if ($alias === $pattern_tokens_removed) {
+    return;
+  }
+
+  $alias = pathauto_clean_alias($alias);
+
+  // If we have arrived at an empty string, discontinue.
+  if (!drupal_strlen($alias)) {
+    return;
+  }
+
+  // If the alias already exists, generate a new, hopefully unique, variant.
+  $original_alias = $alias;
+  pathauto_alias_uniquify($alias, $source, $language);
+  if ($original_alias != $alias) {
+    // Alert the user why this happened.
+    _pathauto_verbose(t('The automatically generated alias %original_alias conflicted with an existing alias. Alias changed to %alias.', array(
+      '%original_alias' => $original_alias,
+      '%alias' => $alias,
+    )), $op);
+  }
+
+  // Return the generated alias if requested.
+  if ($op == 'return') {
+    return $alias;
+  }
+
+  // Build the new path alias array and send it off to be created.
+  $path = array(
+    'source' => $source,
+    'alias' => $alias,
+    'language' => $language,
+  );
+  $path = _force_update_alias_set_alias($path, $existing_alias, $op);
+  return $path;
+}
+
+/**
+ * Private function for Pathauto to create an alias.
+ *
+ * @param $path
+ *   An associative array containing the following keys:
+ *   - source: The internal system path.
+ *   - alias: The URL alias.
+ *   - pid: (optional) Unique path alias identifier.
+ *   - language: (optional) The language of the alias.
+ * @param $existing_alias
+ *   (optional) An associative array of the existing path alias.
+ * @param $op
+ *   An optional string with the operation being performed.
+ *
+ * @return
+ *   The saved path from path_save() or FALSE if the path was not saved.
+ *
+ * @see path_save()
+ */
+function _force_update_alias_set_alias(array $path, $existing_alias = NULL, $op = NULL) {
+  $verbose = _pathauto_verbose(NULL, $op);
+
+  // Alert users if they are trying to create an alias that is the same as the internal path
+  if ($path['source'] == $path['alias']) {
+    if ($verbose) {
+      _pathauto_verbose(t('Ignoring alias %alias because it is the same as the internal path.', array('%alias' => $path['alias'])));
+    }
+    return FALSE;
+  }
+
+  // Skip replacing the current alias with an identical alias
+  if (empty($existing_alias) || $existing_alias['alias'] != $path['alias']) {
+    $path += array('pathauto' => TRUE, 'original' => $existing_alias);
+
+    // If there is already an alias, respect some update actions.
+    if (!empty($existing_alias)) {
+      switch (variable_get('pathauto_update_action', PATHAUTO_UPDATE_ACTION_DELETE)) {
+        case PATHAUTO_UPDATE_ACTION_NO_NEW:
+        case PATHAUTO_UPDATE_ACTION_LEAVE:
+          // Create a new alias instead of overwriting the existing by leaving
+          // $path['pid'] empty.
+          break;
+        case PATHAUTO_UPDATE_ACTION_DELETE:
+          // The delete actions should overwrite the existing alias.
+          $path['pid'] = $existing_alias['pid'];
+          break;
+      }
+    }
+
+    // Save the path array.
+    path_save($path);
+
+    if ($verbose) {
+      if (!empty($existing_alias['pid'])) {
+        _pathauto_verbose(t('Created new alias %alias for %source, replacing %old_alias.', array('%alias' => $path['alias'], '%source' => $path['source'], '%old_alias' => $existing_alias['alias'])));
+      }
+      else {
+        _pathauto_verbose(t('Created new alias %alias for %source.', array('%alias' => $path['alias'], '%source' => $path['source'])));
+      }
+    }
+
+    return $path;
   }
 }
